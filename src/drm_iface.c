@@ -16,6 +16,8 @@
 #include <linux/list.h>
 #include <linux/workqueue.h>
 
+#include <linux/io.h>
+
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_damage_helper.h>
@@ -45,7 +47,15 @@
 #define CMD_CLEAR_SCREEN 0b00100000
 #define CMD_TOGGLE_VCOM 0b01000000
 
+#define GPIO_BASE_ADDR 0x91105000
+#define GPIO_CS_PIN 14
+#define SPI_CS_ADDR1 0x9140b004
+#define SPI_CS_ADDR2 0x9140b000
+
 // Globals
+
+static void __iomem *g_spi_cs_reg1 = NULL;
+static void __iomem *g_spi_cs_reg2 = NULL;
 
 struct overlay_storage_t
 {
@@ -92,6 +102,37 @@ static inline struct sharp_memory_panel *drm_to_panel(struct drm_device *drm)
 	return container_of(drm, struct sharp_memory_panel, drm);
 }
 
+static void set_gpio_cs(struct sharp_memory_panel* panel, u32 val)
+{
+#if 0
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, val);
+	}
+#else
+	u32 reg_val;
+
+	if ((g_spi_cs_reg1 == NULL) || (g_spi_cs_reg2 == NULL)) {
+		return;
+	}
+
+	reg_val = ioread32(g_spi_cs_reg1);
+	if (val) {
+		reg_val |= (1 << GPIO_CS_PIN);
+	} else {
+		reg_val &= ~(1 << GPIO_CS_PIN);
+	}
+	iowrite32(reg_val, g_spi_cs_reg1);
+
+	reg_val = ioread32(g_spi_cs_reg2);
+	if (val) {
+		reg_val |= (1 << GPIO_CS_PIN);
+	} else {
+		reg_val &= ~(1 << GPIO_CS_PIN);
+	}
+	iowrite32(reg_val, g_spi_cs_reg2);
+#endif
+}
+
 static int sharp_memory_spi_toggle_vcom(struct sharp_memory_panel *panel)
 {
 	int rc;
@@ -100,28 +141,21 @@ static int sharp_memory_spi_toggle_vcom(struct sharp_memory_panel *panel)
 		return 0;
 	}
 
-	// Create vcom command SPI transfer
-	panel->cmd_buf[0] = CMD_TOGGLE_VCOM;
-	panel->spi_3_xfers[0].tx_buf = panel->cmd_buf;
-	panel->spi_3_xfers[0].rx_buf = NULL;
-	panel->spi_3_xfers[0].len = 1;
-	panel->trailer_buf[0] = 0;
-	panel->spi_3_xfers[1].tx_buf = panel->trailer_buf;
-	panel->spi_3_xfers[1].rx_buf = NULL;
-	panel->spi_3_xfers[1].len = 1;
+	struct spi_message m;
+	spi_message_init(&m);
 
-	if (panel->gpio_cs) {
-		gpiod_set_value(panel->gpio_cs, 0);
-	}
+	u8 tx_buf[2] = {CMD_TOGGLE_VCOM, 0x00};
+	struct spi_transfer t = {
+		.tx_buf = tx_buf,
+		.len = sizeof(tx_buf),
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&t, &m);
 
-	// Write command
+	set_gpio_cs(panel, 0);
 	ndelay(80);
-
-	rc = spi_sync_transfer(panel->spi, panel->spi_3_xfers, 2);
-
-	if (panel->gpio_cs) {
-		gpiod_set_value(panel->gpio_cs, 1);
-	}
+	rc = spi_sync(panel->spi, &m);
+	set_gpio_cs(panel, 1);
 
 	return rc;
 }
@@ -162,28 +196,21 @@ static int sharp_memory_spi_clear_screen(struct sharp_memory_panel *panel)
 		return 0;
 	}
 
-	// Create screen clear command SPI transfer
-	panel->cmd_buf[0] = CMD_CLEAR_SCREEN;
-	panel->spi_3_xfers[0].tx_buf = panel->cmd_buf;
-	panel->spi_3_xfers[0].rx_buf = NULL;
-	panel->spi_3_xfers[0].len = 1;
-	panel->trailer_buf[0] = 0;
-	panel->spi_3_xfers[1].tx_buf = panel->trailer_buf;
-	panel->spi_3_xfers[1].rx_buf = NULL;
-	panel->spi_3_xfers[1].len = 1;
+	struct spi_message m;
+	spi_message_init(&m);
 
-	if (panel->gpio_cs) {
-		gpiod_set_value(panel->gpio_cs, 0);
-	}
+	u8 tx_buf[2] = {CMD_CLEAR_SCREEN, 0x00};
+	struct spi_transfer t = {
+		.tx_buf = tx_buf,
+		.len = sizeof(tx_buf),
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&t, &m);
 
-	// Write clear screen command
+	set_gpio_cs(panel, 0);
 	ndelay(80);
-
-	rc = spi_sync_transfer(panel->spi, panel->spi_3_xfers, 2);
-
-	if (panel->gpio_cs) {
-		gpiod_set_value(panel->gpio_cs, 1);
-	}
+	rc = spi_sync(panel->spi, &m);
+	set_gpio_cs(panel, 1);
 
 	return rc;
 }
@@ -205,34 +232,36 @@ static int sharp_memory_spi_write_tagged_lines(struct sharp_memory_panel *panel,
 		return 0;
 	}
 
-	// Write line command
+	struct spi_message m;
+	spi_message_init(&m);
+
 	panel->cmd_buf[0] = 0b10000000;
-	panel->spi_3_xfers[0].tx_buf = panel->cmd_buf;
-	panel->spi_3_xfers[0].rx_buf = NULL;
-	panel->spi_3_xfers[0].len = 1;
+	struct spi_transfer cmd_tx = {
+		.tx_buf = panel->cmd_buf,
+		.len = 1,
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&cmd_tx, &m);
 
-	// Line data
-	panel->spi_3_xfers[1].tx_buf = line_data;
-	panel->spi_3_xfers[1].rx_buf = NULL;
-	panel->spi_3_xfers[1].len = len;
+	struct spi_transfer line_tx = {
+		.tx_buf = line_data,
+		.len = len,
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&line_tx, &m);
 
-	// Trailer
 	panel->trailer_buf[0] = 0;
-	panel->spi_3_xfers[2].tx_buf = panel->trailer_buf;
-	panel->spi_3_xfers[2].rx_buf = NULL;
-	panel->spi_3_xfers[2].len = 1;
+	struct spi_transfer trailer_tx = {
+		.tx_buf = panel->trailer_buf,
+		.len = 1,
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&trailer_tx, &m);
 
-	if (panel->gpio_cs) {
-		gpiod_set_value(panel->gpio_cs, 0);
-	}
-
+	set_gpio_cs(panel, 0);
 	ndelay(80);
-
-	rc = spi_sync_transfer(panel->spi, panel->spi_3_xfers, 3);
-
-	if (panel->gpio_cs) {
-		gpiod_set_value(panel->gpio_cs, 1);
-	}
+	rc = spi_sync(panel->spi, &m);
+	set_gpio_cs(panel, 1);
 
 	return rc;
 }
@@ -459,9 +488,7 @@ static void sharp_memory_pipe_enable(struct drm_simple_display_pipe *pipe,
 	if (panel->gpio_vcom) {
 		gpiod_set_value(panel->gpio_vcom, 0);
 	}
-	if (panel->gpio_cs) {
-		gpiod_set_value(panel->gpio_cs, 1);
-	}
+	set_gpio_cs(panel, 1);
 	usleep_range(5000, 10000);
 
 	// Clear display
@@ -637,6 +664,20 @@ int drm_probe(struct spi_device *spi)
 		printk(KERN_INFO "sharp_memory: Failed to get GPIO 'cs'\n");
 		panel->gpio_cs = NULL;
 	}
+
+#if 1
+	void __iomem *gpio_reg;
+
+	gpio_reg = ioremap(GPIO_BASE_ADDR + (4 * GPIO_CS_PIN), 4);
+	g_spi_cs_reg1 = ioremap(SPI_CS_ADDR1, 4);
+	g_spi_cs_reg2 = ioremap(SPI_CS_ADDR2, 4);
+
+	if (!gpio_reg || !g_spi_cs_reg1 || !g_spi_cs_reg2) {
+		pr_err("sharp_drm failed to map memory regions\n");
+	} else {
+		iowrite32(0x1df, gpio_reg);
+	}
+#endif
 
 	// Initalize DRM mode
 	drm = &panel->drm;

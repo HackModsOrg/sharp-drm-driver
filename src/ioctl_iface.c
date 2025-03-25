@@ -36,7 +36,7 @@ int sharp_memory_ioctl_ov_add(struct drm_device *dev,
 		return -1;
 	}
 	if ((copy_from_user_rc = copy_from_user(pixels, ov->pixels, ov->width * ov->height))) {
-		printk(KERN_ERR "sharp_drm: failed to copy overlay buffer from userspace (could not copy %zu/%zu)\n",
+		printk(KERN_ERR "sharp_drm: failed to copy overlay buffer from userspace (could not copy %zu/%d)\n",
 			copy_from_user_rc, ov->width * ov->height);
 		kfree(pixels);
 		return -1;
