@@ -104,33 +104,9 @@ static inline struct sharp_memory_panel *drm_to_panel(struct drm_device *drm)
 
 static void set_gpio_cs(struct sharp_memory_panel* panel, u32 val)
 {
-#if 0
 	if (panel->gpio_cs) {
 		gpiod_set_value(panel->gpio_cs, val);
 	}
-#else
-	u32 reg_val;
-
-	if ((g_spi_cs_reg1 == NULL) || (g_spi_cs_reg2 == NULL)) {
-		return;
-	}
-
-	reg_val = ioread32(g_spi_cs_reg1);
-	if (val) {
-		reg_val |= (1 << GPIO_CS_PIN);
-	} else {
-		reg_val &= ~(1 << GPIO_CS_PIN);
-	}
-	iowrite32(reg_val, g_spi_cs_reg1);
-
-	reg_val = ioread32(g_spi_cs_reg2);
-	if (val) {
-		reg_val |= (1 << GPIO_CS_PIN);
-	} else {
-		reg_val &= ~(1 << GPIO_CS_PIN);
-	}
-	iowrite32(reg_val, g_spi_cs_reg2);
-#endif
 }
 
 static int sharp_memory_spi_toggle_vcom(struct sharp_memory_panel *panel)
@@ -649,35 +625,23 @@ int drm_probe(struct spi_device *spi)
 	}
 
 	// Initialize GPIO
-	panel->gpio_disp = devm_gpiod_get_optional(dev, "disp", GPIOD_OUT_HIGH);
-	if (IS_ERR(panel->gpio_disp))
-		return dev_err_probe(dev, PTR_ERR(panel->gpio_disp), "Failed to get GPIO 'disp'\n");
+	panel->gpio_disp = devm_gpiod_get(dev, "disp", GPIOD_OUT_HIGH);
+	if (IS_ERR(panel->gpio_disp)) {
+		printk(KERN_INFO "sharp_memory: warning: failed to get GPIO 'disp' from DTS\n");
+		panel->gpio_disp = NULL;
+	}
 
 	panel->gpio_vcom = devm_gpiod_get(dev, "vcom", GPIOD_OUT_LOW);
 	if (IS_ERR(panel->gpio_vcom)) {
-		printk(KERN_INFO "sharp_memory: Failed to get GPIO 'vcom'\n");
+		printk(KERN_INFO "sharp_memory: warning: failed to get GPIO 'vcom' from DTS\n");
 		panel->gpio_vcom = NULL;
 	}
 
 	panel->gpio_cs = devm_gpiod_get(dev, "cs", GPIOD_OUT_HIGH);
 	if (IS_ERR(panel->gpio_cs)) {
-		printk(KERN_INFO "sharp_memory: Failed to get GPIO 'cs'\n");
+		printk(KERN_INFO "sharp_memory: warning: failed to get GPIO 'cs' from DTS\n");
 		panel->gpio_cs = NULL;
 	}
-
-#if 1
-	void __iomem *gpio_reg;
-
-	gpio_reg = ioremap(GPIO_BASE_ADDR + (4 * GPIO_CS_PIN), 4);
-	g_spi_cs_reg1 = ioremap(SPI_CS_ADDR1, 4);
-	g_spi_cs_reg2 = ioremap(SPI_CS_ADDR2, 4);
-
-	if (!gpio_reg || !g_spi_cs_reg1 || !g_spi_cs_reg2) {
-		pr_err("sharp_drm failed to map memory regions\n");
-	} else {
-		iowrite32(0x1df, gpio_reg);
-	}
-#endif
 
 	// Initalize DRM mode
 	drm = &panel->drm;
