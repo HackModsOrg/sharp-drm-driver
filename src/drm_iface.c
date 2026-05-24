@@ -2,11 +2,12 @@
 /*
  * DRM driver for 2.7" Sharp Memory LCD
  *
- * Copyright 2023 Andrew D'Angelo
+ * Copyright 2026 Andrew D'Angelo
  */
 
 #include <linux/version.h>
 #include <linux/delay.h>
+#include <linux/fs.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/property.h>
@@ -14,6 +15,11 @@
 #include <linux/spi/spi.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
+#include <linux/workqueue.h>
+
+#include <linux/io.h>
+#include <linux/namei.h>
+#include <linux/tty.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
@@ -32,7 +38,10 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#include <drm/clients/drm_client_setup.h>
+#include <drm/drm_fbdev_dma.h>
+#else
 #include <drm/drm_fbdev_generic.h>
 #endif
 
@@ -42,8 +51,17 @@
 
 #define CMD_WRITE_LINE 0b10000000
 #define CMD_CLEAR_SCREEN 0b00100000
+#define CMD_TOGGLE_VCOM 0b01000000
+
+#define GPIO_BASE_ADDR 0x91105000
+#define GPIO_CS_PIN 14
+#define SPI_CS_ADDR1 0x9140b004
+#define SPI_CS_ADDR2 0x9140b000
 
 // Globals
+
+static void __iomem *g_spi_cs_reg1 = NULL;
+static void __iomem *g_spi_cs_reg2 = NULL;
 
 struct overlay_storage_t
 {
@@ -70,6 +88,7 @@ struct sharp_memory_panel
 	struct drm_framebuffer *fb;
 
 	struct timer_list vcom_timer;
+	struct work_struct vcom_work;
 
 	unsigned int height;
 	unsigned int width;
@@ -81,6 +100,9 @@ struct sharp_memory_panel
 
 	struct gpio_desc *gpio_disp;
 	struct gpio_desc *gpio_vcom;
+	struct gpio_desc *gpio_cs;
+
+	struct file *qemu_file; /* non-NULL when qemu_display_dev is used */
 };
 
 static inline struct sharp_memory_panel *drm_to_panel(struct drm_device *drm)
@@ -88,15 +110,94 @@ static inline struct sharp_memory_panel *drm_to_panel(struct drm_device *drm)
 	return container_of(drm, struct sharp_memory_panel, drm);
 }
 
+static void set_gpio_cs(struct sharp_memory_panel* panel, u32 val)
+{
+	if (panel->gpio_cs) {
+		gpiod_set_value(panel->gpio_cs, val);
+	}
+}
+
+static int sharp_memory_qemu_write(struct sharp_memory_panel *panel,
+	const void *data, size_t len)
+{
+	const u8 *ptr = data;
+	size_t total = 0;
+	loff_t pos = 0;
+
+	while (total < len) {
+		ssize_t written = kernel_write(panel->qemu_file, ptr + total,
+			len - total, &pos);
+
+		if (written <= 0) {
+			printk(KERN_ERR "sharp_memory: qemu_write failed after %zu/%zu bytes: %zd\n",
+			       total, len, written);
+			return (written < 0) ? (int)written : -EIO;
+		}
+
+		total += written;
+
+		if (need_resched()) {
+			cond_resched();
+		}
+	}
+
+	return 0;
+}
+
+static int sharp_memory_spi_toggle_vcom(struct sharp_memory_panel *panel)
+{
+	int rc;
+
+	if ((panel == NULL) || (panel->spi == NULL)) {
+		return 0;
+	}
+
+	struct spi_message m;
+	spi_message_init(&m);
+
+	u8 tx_buf[2] = {CMD_TOGGLE_VCOM, 0x00};
+	struct spi_transfer t = {
+		.tx_buf = tx_buf,
+		.len = sizeof(tx_buf),
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&t, &m);
+
+	set_gpio_cs(panel, 0);
+	ndelay(80);
+	rc = spi_sync(panel->spi, &m);
+	set_gpio_cs(panel, 1);
+
+	return rc;
+}
+
+static void sharp_memory_vcom_work(struct work_struct *work)
+{
+	struct sharp_memory_panel *panel = container_of(work, struct sharp_memory_panel, vcom_work);
+
+	sharp_memory_spi_toggle_vcom(panel);
+}
+
+
 static void vcom_timer_callback(struct timer_list *t)
 {
 	static u8 vcom_setting = 0;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+	struct sharp_memory_panel *panel = container_of(t, struct sharp_memory_panel, vcom_timer);
+#else
 	struct sharp_memory_panel *panel = from_timer(panel, t, vcom_timer);
+#endif
 
 	// Toggle the GPIO pin
-	vcom_setting = (vcom_setting) ? 0 : 1;
-	gpiod_set_value(panel->gpio_vcom, vcom_setting);
+	if (panel->gpio_vcom) {
+		vcom_setting = (vcom_setting) ? 0 : 1;
+		gpiod_set_value(panel->gpio_vcom, vcom_setting);
+
+	// Send VCOM command
+	} else {
+		schedule_work(&panel->vcom_work);
+	}
 
 	// Reschedule the timer
 	mod_timer(&panel->vcom_timer, jiffies + msecs_to_jiffies(1000));
@@ -105,19 +206,34 @@ static void vcom_timer_callback(struct timer_list *t)
 static int sharp_memory_spi_clear_screen(struct sharp_memory_panel *panel)
 {
 	int rc;
+	u8 tx_buf[2] = {CMD_CLEAR_SCREEN, 0x00};
 
-	// Create screen clear command SPI transfer
-	panel->cmd_buf[0] = CMD_CLEAR_SCREEN;
-	panel->spi_3_xfers[0].tx_buf = panel->cmd_buf;
-	panel->spi_3_xfers[0].len = 1;
-	panel->trailer_buf[0] = 0;
-	panel->spi_3_xfers[1].tx_buf = panel->trailer_buf;
-	panel->spi_3_xfers[1].len = 1;
+	if (panel == NULL) {
+		return 0;
+	}
 
-	// Write clear screen command
+	if (panel->qemu_file) {
+		return sharp_memory_qemu_write(panel, tx_buf, sizeof(tx_buf));
+	}
+
+	if (panel->spi == NULL) {
+		return 0;
+	}
+
+	struct spi_message m;
+	spi_message_init(&m);
+
+	struct spi_transfer t = {
+		.tx_buf = tx_buf,
+		.len = sizeof(tx_buf),
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&t, &m);
+
+	set_gpio_cs(panel, 0);
 	ndelay(80);
-
-	rc = spi_sync_transfer(panel->spi, panel->spi_3_xfers, 2);
+	rc = spi_sync(panel->spi, &m);
+	set_gpio_cs(panel, 1);
 
 	return rc;
 }
@@ -135,23 +251,53 @@ static int sharp_memory_spi_write_tagged_lines(struct sharp_memory_panel *panel,
 {
 	int rc;
 
-	// Write line command
-	panel->cmd_buf[0] = 0b10000000;
-	panel->spi_3_xfers[0].tx_buf = panel->cmd_buf;
-	panel->spi_3_xfers[0].len = 1;
+	if (panel == NULL) {
+		return 0;
+	}
 
-	// Line data
-	panel->spi_3_xfers[1].tx_buf = line_data;
-	panel->spi_3_xfers[1].len = len;
+	if (panel->qemu_file) {
+		u8 cmd = CMD_WRITE_LINE;
+		u8 trailer = 0;
+		rc = sharp_memory_qemu_write(panel, &cmd, 1);
+		if (!rc) rc = sharp_memory_qemu_write(panel, line_data, len);
+		if (!rc) rc = sharp_memory_qemu_write(panel, &trailer, 1);
+		return rc;
+	}
 
-	// Trailer
+	if (panel->spi == NULL) {
+		return 0;
+	}
+
+	struct spi_message m;
+	spi_message_init(&m);
+
+	panel->cmd_buf[0] = CMD_WRITE_LINE;
+	struct spi_transfer cmd_tx = {
+		.tx_buf = panel->cmd_buf,
+		.len = 1,
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&cmd_tx, &m);
+
+	struct spi_transfer line_tx = {
+		.tx_buf = line_data,
+		.len = len,
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&line_tx, &m);
+
 	panel->trailer_buf[0] = 0;
-	panel->spi_3_xfers[2].tx_buf = panel->trailer_buf;
-	panel->spi_3_xfers[2].len = 1;
+	struct spi_transfer trailer_tx = {
+		.tx_buf = panel->trailer_buf,
+		.len = 1,
+		.speed_hz = panel->spi->max_speed_hz,
+	};
+	spi_message_add_tail(&trailer_tx, &m);
 
+	set_gpio_cs(panel, 0);
 	ndelay(80);
-
-	rc = spi_sync_transfer(panel->spi, panel->spi_3_xfers, 3);
+	rc = spi_sync(panel->spi, &m);
+	set_gpio_cs(panel, 1);
 
 	return rc;
 }
@@ -261,6 +407,9 @@ static int sharp_memory_clip_mono_tagged(struct sharp_memory_panel* panel, size_
 	int rc;
 	struct drm_gem_dma_object *dma_obj;
 	struct iosys_map dst, vmap;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	struct drm_format_conv_state fmtcnv_state = DRM_FORMAT_CONV_STATE_INIT;
+#endif
 
 	// Get GEM memory manager
 	dma_obj = drm_fb_dma_get_gem_obj(fb, 0);
@@ -275,7 +424,11 @@ static int sharp_memory_clip_mono_tagged(struct sharp_memory_panel* panel, size_
 	iosys_map_set_vaddr(&dst, buf);
 	iosys_map_set_vaddr(&vmap, dma_obj->vaddr);
 	// DMA `clip` into `buf` and convert to 8-bit grayscale
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	drm_fb_xrgb8888_to_gray8(&dst, NULL, &vmap, fb, clip, &fmtcnv_state);
+#else
 	drm_fb_xrgb8888_to_gray8(&dst, NULL, &vmap, fb, clip);
+#endif
 
 	// End DMA area
 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
@@ -348,7 +501,9 @@ static void power_off(struct sharp_memory_panel *panel)
 	if (panel->gpio_disp) {
 		gpiod_set_value(panel->gpio_disp, 0);
 	}
-	gpiod_set_value(panel->gpio_vcom, 0);
+	if (panel->gpio_vcom) {
+		gpiod_set_value(panel->gpio_vcom, 0);
+	}
 }
 
 static void sharp_memory_pipe_enable(struct drm_simple_display_pipe *pipe,
@@ -373,7 +528,10 @@ static void sharp_memory_pipe_enable(struct drm_simple_display_pipe *pipe,
 	if (panel->gpio_disp) {
 		gpiod_set_value(panel->gpio_disp, 1);
 	}
-	gpiod_set_value(panel->gpio_vcom, 0);
+	if (panel->gpio_vcom) {
+		gpiod_set_value(panel->gpio_vcom, 0);
+	}
+	set_gpio_cs(panel, 1);
 	usleep_range(5000, 10000);
 
 	// Clear display
@@ -385,6 +543,7 @@ static void sharp_memory_pipe_enable(struct drm_simple_display_pipe *pipe,
 	}
 
 	// Initialize and schedule the VCOM timer
+	INIT_WORK(&panel->vcom_work, sharp_memory_vcom_work);
 	timer_setup(&panel->vcom_timer, vcom_timer_callback, 0);
 	mod_timer(&panel->vcom_timer, jiffies + msecs_to_jiffies(500));
 
@@ -406,7 +565,11 @@ static void sharp_memory_pipe_disable(struct drm_simple_display_pipe *pipe)
 	spi = panel->spi;
 
 	// Cancel the timer
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+	timer_delete_sync(&panel->vcom_timer);
+#else
 	del_timer_sync(&panel->vcom_timer);
+#endif
 
 	power_off(panel);
 }
@@ -440,16 +603,26 @@ static int sharp_memory_connector_get_modes(struct drm_connector *connector)
 	return drm_connector_helper_get_modes_fixed(connector, panel->mode);
 }
 
+
+// https://github.com/torvalds/linux/commit/4cd24d4b1a9548f42cdb7f449edc6f869a8ae730
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+static struct drm_framebuffer* create_and_store_fb(struct drm_device *dev,
+	struct drm_file *file, const struct drm_format_info *info,
+	const struct drm_mode_fb_cmd2 *mode_cmd)
+{
+	struct sharp_memory_panel *panel = drm_to_panel(dev);
+	panel->fb = drm_gem_fb_create_with_dirty(dev, file, info, mode_cmd);
+	return panel->fb;
+}
+#else
 static struct drm_framebuffer* create_and_store_fb(struct drm_device *dev,
 	struct drm_file *file, const struct drm_mode_fb_cmd2 *mode_cmd)
 {
-	struct sharp_memory_panel *panel;
-
-	// Initialize framebuffer
-	panel = drm_to_panel(dev);
+	struct sharp_memory_panel *panel = drm_to_panel(dev);
 	panel->fb = drm_gem_fb_create_with_dirty(dev, file, mode_cmd);
 	return panel->fb;
 }
+#endif
 
 static const struct drm_connector_helper_funcs sharp_memory_connector_hfuncs = {
 	.get_modes = sharp_memory_connector_get_modes,
@@ -492,11 +665,16 @@ static const struct drm_driver sharp_memory_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.fops = &sharp_memory_fops,
 	DRM_GEM_DMA_DRIVER_OPS_VMAP,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	.fbdev_probe = drm_fbdev_dma_driver_fbdev_probe,
+#endif
 	.name = "sharp_drm",
 	.desc = "Sharp Memory LCD panel",
-	.date = "20230713",
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+	.date = "20260401",
+#endif
 	.major = 1,
-	.minor = 1,
+	.minor = 5,
 
 	.ioctls = sharp_memory_ioctls,
 	.num_ioctls = ARRAY_SIZE(sharp_memory_ioctls)
@@ -533,13 +711,23 @@ int drm_probe(struct spi_device *spi)
 	}
 
 	// Initialize GPIO
-	panel->gpio_disp = devm_gpiod_get_optional(dev, "disp", GPIOD_OUT_HIGH);
-	if (IS_ERR(panel->gpio_disp))
-		return dev_err_probe(dev, PTR_ERR(panel->gpio_disp), "Failed to get GPIO 'disp'\n");
+	panel->gpio_disp = devm_gpiod_get(dev, "disp", GPIOD_OUT_HIGH);
+	if (IS_ERR(panel->gpio_disp)) {
+		printk(KERN_INFO "sharp_memory: warning: failed to get GPIO 'disp' from DTS\n");
+		panel->gpio_disp = NULL;
+	}
 
 	panel->gpio_vcom = devm_gpiod_get(dev, "vcom", GPIOD_OUT_LOW);
-	if (IS_ERR(panel->gpio_vcom))
-		return dev_err_probe(dev, PTR_ERR(panel->gpio_vcom), "Failed to get GPIO 'vcom'\n");
+	if (IS_ERR(panel->gpio_vcom)) {
+		printk(KERN_INFO "sharp_memory: warning: failed to get GPIO 'vcom' from DTS\n");
+		panel->gpio_vcom = NULL;
+	}
+
+	panel->gpio_cs = devm_gpiod_get(dev, "cs", GPIOD_OUT_HIGH);
+	if (IS_ERR(panel->gpio_cs)) {
+		printk(KERN_INFO "sharp_memory: warning: failed to get GPIO 'cs' from DTS\n");
+		panel->gpio_cs = NULL;
+	}
 
 	// Initalize DRM mode
 	drm = &panel->drm;
@@ -598,7 +786,11 @@ int drm_probe(struct spi_device *spi)
 
 	// fbdev setup
 	spi_set_drvdata(spi, drm);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	drm_client_setup(drm, NULL);
+#else
 	drm_fbdev_generic_setup(drm, 0);
+#endif
 
 	printk(KERN_INFO "sharp_memory: successful probe\n");
 
@@ -626,7 +818,162 @@ void drm_remove(struct spi_device *spi)
 	if (panel->gpio_disp) {
 		devm_gpiod_put(dev, panel->gpio_disp);
 	}
-	devm_gpiod_put(dev, panel->gpio_vcom);
+	if (panel->gpio_vcom) {
+		devm_gpiod_put(dev, panel->gpio_vcom);
+	}
+
+	drm_dev_unplug(drm);
+	drm_atomic_helper_shutdown(drm);
+}
+
+/* Set the tty at serial_dev to raw mode (clear OPOST) so that Sharp
+ * protocol bytes like 0x0a are not translated to CR+LF by the line
+ * discipline before reaching QEMU.  Uses tty_kopen_exclusive() which
+ * is EXPORT_SYMBOL_GPL since Linux 5.11, avoiding the kernel-internal
+ * file_tty() that was removed from module-visible headers in 6.12.
+ */
+static void prv_set_tty_raw(const char *dev_path)
+{
+	struct path p;
+	dev_t rdev;
+	struct tty_struct *tty;
+	struct ktermios termios;
+
+	if (kern_path(dev_path, LOOKUP_FOLLOW, &p) != 0)
+		return;
+
+	rdev = p.dentry->d_inode->i_rdev;
+	path_put(&p);
+
+	if (!MAJOR(rdev))
+		return;
+
+	tty = tty_kopen_exclusive(rdev);
+	if (IS_ERR(tty)) {
+		printk(KERN_WARNING "sharp_memory: tty_kopen_exclusive(%s): %ld\n",
+		       dev_path, PTR_ERR(tty));
+		return;
+	}
+
+	termios = tty->termios;
+	termios.c_oflag &= ~OPOST;
+	tty_set_termios(tty, &termios);
+	tty_kclose(tty);
+}
+
+int drm_probe_qemu(struct device *dev, const char *serial_dev)
+{
+	const struct drm_display_mode *mode;
+	struct sharp_memory_panel *panel;
+	struct drm_device *drm;
+	int ret;
+
+	printk(KERN_INFO "sharp_memory: entering drm_probe_qemu, serial=%s\n", serial_dev);
+
+	// Platform devices need an explicit DMA mask
+	dev->coherent_dma_mask = DMA_BIT_MASK(32);
+	dev->dma_mask = &dev->coherent_dma_mask;
+
+	panel = devm_drm_dev_alloc(dev, &sharp_memory_driver,
+		struct sharp_memory_panel, drm);
+	if (IS_ERR(panel)) {
+		return PTR_ERR(panel);
+	}
+
+	// No SPI or GPIOs in QEMU mode
+	panel->spi = NULL;
+	panel->gpio_disp = NULL;
+	panel->gpio_vcom = NULL;
+	panel->gpio_cs   = NULL;
+
+	// Disable OPOST output processing before opening so Sharp protocol
+	// bytes are not mangled in transit to QEMU.
+	prv_set_tty_raw(serial_dev);
+
+	// Open serial device for display output
+	panel->qemu_file = filp_open(serial_dev, O_WRONLY | O_NOCTTY, 0);
+	if (IS_ERR(panel->qemu_file)) {
+		printk(KERN_ERR "sharp_memory: failed to open %s: %ld\n",
+			serial_dev, PTR_ERR(panel->qemu_file));
+		return PTR_ERR(panel->qemu_file);
+	}
+
+	drm = &panel->drm;
+	ret = drmm_mode_config_init(drm);
+	if (ret) {
+		goto err_close;
+	}
+	drm->mode_config.funcs = &sharp_memory_mode_config_funcs;
+
+	panel->fb = NULL;
+	mode = &sharp_memory_ls027b7dh01_mode;
+	panel->mode = mode;
+	panel->width = mode->hdisplay;
+	panel->height = mode->vdisplay;
+
+	panel->buf = devm_kzalloc(dev, panel->width * panel->height, GFP_KERNEL);
+	panel->spi_3_xfers = devm_kzalloc(dev, sizeof(struct spi_transfer) * 3, GFP_KERNEL);
+	panel->cmd_buf = devm_kzalloc(dev, 1, GFP_KERNEL);
+	panel->trailer_buf = devm_kzalloc(dev, 1, GFP_KERNEL);
+
+	drm->mode_config.min_width = mode->hdisplay;
+	drm->mode_config.max_width = mode->hdisplay;
+	drm->mode_config.min_height = mode->vdisplay;
+	drm->mode_config.max_height = mode->vdisplay;
+
+	ret = drm_connector_init(drm, &panel->connector, &sharp_memory_connector_funcs,
+		DRM_MODE_CONNECTOR_SPI);
+	if (ret) {
+		goto err_close;
+	}
+	drm_connector_helper_add(&panel->connector, &sharp_memory_connector_hfuncs);
+
+	ret = drm_simple_display_pipe_init(drm, &panel->pipe, &sharp_memory_pipe_funcs,
+		sharp_memory_formats, ARRAY_SIZE(sharp_memory_formats),
+		NULL, &panel->connector);
+	if (ret) {
+		goto err_close;
+	}
+
+	drm_plane_enable_fb_damage_clips(&panel->pipe.plane);
+	drm_mode_config_reset(drm);
+
+	printk(KERN_INFO "sharp_memory: registering DRM device (QEMU)\n");
+	ret = drm_dev_register(drm, 0);
+	if (ret) {
+		goto err_close;
+	}
+
+	dev_set_drvdata(dev, drm);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	drm_client_setup(drm, NULL);
+#else
+	drm_fbdev_generic_setup(drm, 0);
+#endif
+
+	printk(KERN_INFO "sharp_memory: drm_probe_qemu successful\n");
+	return 0;
+
+err_close:
+	filp_close(panel->qemu_file, NULL);
+	panel->qemu_file = NULL;
+	return ret;
+}
+
+void drm_remove_qemu(struct device *dev)
+{
+	struct drm_device *drm;
+	struct sharp_memory_panel *panel;
+
+	printk(KERN_INFO "sharp_memory: drm_remove_qemu\n");
+
+	drm = dev_get_drvdata(dev);
+	panel = drm_to_panel(drm);
+
+	if (panel->qemu_file) {
+		filp_close(panel->qemu_file, NULL);
+		panel->qemu_file = NULL;
+	}
 
 	drm_dev_unplug(drm);
 	drm_atomic_helper_shutdown(drm);
