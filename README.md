@@ -9,6 +9,11 @@ DRM kernel driver for 2.7" 400x240 Sharp memory LCD panel.
 
 ## User Guide
 
+> [!IMPORTANT]
+> Blepis v2 uses `SPI_CS1` instead of `SPI_CS0` for the Sharp LCD!
+> You need to make sure to build the DTS file with the correct BOARD define.
+> See the instructions in [Building from source](#building-from-source) below.
+
 This is a kernel device driver to provide a display device to the Linux kernel.
 
 ### Font Configuration
@@ -57,8 +62,16 @@ Install the Linux kernel headers
 
 Build, install, and enable the kernel module:
 
-    make
-    sudo make install
+```bash
+
+  # for BLEPIS v2
+  make BOARD=BLEPIS_V2
+
+  # otherwise
+  make
+
+  sudo make install
+```
 
 To remove:
 
