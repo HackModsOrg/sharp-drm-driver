@@ -1,6 +1,7 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #include <linux/cdev.h>
+#include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/overflow.h>
 #include <linux/uaccess.h>
@@ -27,17 +28,17 @@ int sharp_memory_ioctl_redraw(struct drm_device *dev, void *data,
 int sharp_memory_ioctl_ov_add(struct drm_device *dev,
 	void *in_overlay_out_storage, struct drm_file *file)
 {
-	union sharp_memory_ioctl_ov_add_t *add
-		= (union sharp_memory_ioctl_ov_add_t *)in_overlay_out_storage;
+	struct sharp_memory_ioctl_ov_add_t *add = in_overlay_out_storage;
 	unsigned char *pixels = NULL;
 	unsigned long copy_from_user_rc;
-	struct sharp_overlay_t ov;
+	struct sharp_overlay_t ov = {
+		.x = add->x,
+		.y = add->y,
+		.width = add->width,
+		.height = add->height,
+		.pixels = u64_to_user_ptr(add->pixels),
+	};
 	size_t pixel_count;
-
-	if (copy_from_user(&ov, add->in_overlay, sizeof(ov))) {
-		printk(KERN_ERR "sharp_drm: failed to copy overlay descriptor from userspace\n");
-		return -EFAULT;
-	}
 
 	if ((ov.width <= 0) || (ov.height <= 0) ||
 		check_mul_overflow((size_t)ov.width, (size_t)ov.height, &pixel_count)) {
@@ -59,7 +60,7 @@ int sharp_memory_ioctl_ov_add(struct drm_device *dev,
 	}
 
 	// Add overlay (copies `pixels`)
-	add->out_storage = drm_add_overlay(ov.x, ov.y, ov.width, ov.height,
+	add->out_storage = (uintptr_t)drm_add_overlay(ov.x, ov.y, ov.width, ov.height,
 		pixels);
 	kfree(pixels);
 
