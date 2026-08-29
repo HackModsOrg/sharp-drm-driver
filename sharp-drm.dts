@@ -20,11 +20,11 @@
 	};
 
 	fragment@1 {
-                target = <&spi0_pins>;
-                __overlay__ {
-                        brcm,pins = <0x0a 0x0b>; /* skipping bcm9 MISO */
-                };
-        };
+		target = <&spi0_pins>;
+		__overlay__ {
+			brcm,pins = <0x0a 0x0b>; /* skipping bcm9 MISO */
+		};
+	};
 
 	fragment@2 {
 		target = <&gpio>;
@@ -43,14 +43,30 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
+#ifndef BLEPIS_V2
 			sharp_drm: sharp_drm@0{
+#else
+			sharp_drm: sharp_drm@1{
+#endif
 				compatible = "sharp-drm";
+#ifndef BLEPIS_V2
 				reg = <0>;
+#else
+				// Use CE1 on GPIO7 as CS
+				reg = <1>;
+#endif
 				pinctrl-names = "default";
 				pinctrl-0 = <&sharp_pins>;
 
 				vcom-gpios = <&gpio 23 0>;
+#ifndef BLEPIS_V2
 				disp-gpios = <&gpio 22 0>;
+#else
+				// Use GPIO6 for DISP_CE
+				// not used on the Sharp LCD anyways, but GPIO22 is
+				// certainly not correct anymore
+				disp-gpios = <&gpio 6 0>;
+#endif
 
 				spi-cs-high = <1>;
 				spi-max-frequency = <4000000>;
